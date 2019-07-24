@@ -56,6 +56,7 @@ import android.util.Log;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothClass;
+import android.bluetooth.BluetoothQualityReport;
 import com.android.bluetooth.Utils;
 
 import android.content.Intent;
@@ -69,6 +70,10 @@ final class Vendor {
     // Split A2dp will be enabled by default
     private boolean splitA2dpEnabled = true;
     private static boolean PowerbackoffStatus = false;
+    // SWB will be enabled by default
+    private boolean isSwbEnabled = true;
+    // SWB-PM will be enabled by default
+    private boolean isSwbPmEnabled = true;
 
     static {
         classInitNative();
@@ -88,6 +93,10 @@ final class Vendor {
         Log.d(TAG,"a2dpOffloadCap: " + a2dpOffloadCap);
         splitA2dpEnabled = isSplitA2dpEnabledNative();
         Log.d(TAG,"splitA2dpEnabled: " + splitA2dpEnabled);
+        isSwbEnabled = isSwbEnabledNative();
+        Log.d(TAG,"isSwbEnabled: " + isSwbEnabled);
+        isSwbPmEnabled = isSwbPmEnabledNative();
+        Log.d(TAG,"isSwbPmEnabled: " + isSwbPmEnabled);
     }
 
     public void bredrCleanup() {
@@ -176,6 +185,31 @@ final class Vendor {
         mService.sendBroadcast(intent, AdapterService.BLUETOOTH_PERM);
     }
 
+    private void bqrDeliver(byte[] remoteAddr,
+            int lmpVer, int lmpSubVer, int manufacturerId, byte[] bqrRawData) {
+        String remoteName = "";
+        int remoteCoD = 0;
+        String addr = Utils.getAddressStringFromByte(remoteAddr);
+        if (addr != null) {
+            BluetoothDevice device = BluetoothAdapter.getDefaultAdapter().getRemoteDevice(addr);
+            remoteName = mService.getRemoteName(device);
+            remoteCoD = mService.getRemoteClass(device);
+        }
+
+        BluetoothQualityReport bqr;
+        try {
+            bqr = new BluetoothQualityReport(addr, lmpVer, lmpSubVer,
+                    manufacturerId, remoteName, remoteCoD, bqrRawData);
+        } catch (Exception e) {
+            Log.e(TAG, "bqrDeliver: failed to create bqr", e);
+            return;
+        }
+        Log.d(TAG, "" + bqr);
+        Intent intent = new Intent(BluetoothDevice.ACTION_REMOTE_ISSUE_OCCURRED);
+        intent.putExtra(BluetoothDevice.EXTRA_BQR, bqr);
+        mService.sendBroadcast(intent, AdapterService.BLUETOOTH_PERM);
+    }
+
     void ssr_cleanup_callback() {
         Log.e(TAG,"ssr_cleanup_callback");
         mService.ssrCleanupCallback();
@@ -255,6 +289,12 @@ final class Vendor {
     public boolean isSplitA2dpEnabled() {
         return splitA2dpEnabled;
     }
+    public boolean isSwbEnabled() {
+        return isSwbEnabled;
+    }
+    public boolean isSwbPmEnabled() {
+        return isSwbPmEnabled;
+    }
     private native void bredrcleanupNative();
     private native void bredrstartupNative();
     private native void initNative();
@@ -269,4 +309,6 @@ final class Vendor {
     private native String getSocNameNative();
     private native String getA2apOffloadCapabilityNative();
     private native boolean isSplitA2dpEnabledNative();
+    private native boolean isSwbEnabledNative();
+    private native boolean isSwbPmEnabledNative();
 }

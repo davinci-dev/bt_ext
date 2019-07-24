@@ -32,6 +32,12 @@
  * IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#define BTA_AG_TWSP_BATTERY_UPDATE 255
+
+#include "bta_ag_api.h"
+
+void btif_handle_vendor_hf_events(uint16_t event, tBTA_AG* data,
+                                  RawAddress *bd_addr);
 namespace bluetooth {
 namespace headset {
 
@@ -40,6 +46,8 @@ bool is_twsp_device_connected();
 int get_idx_primary_eb(RawAddress* bd_addr);
 
 int btif_hf_get_other_connected_twsp_index(int idx);
+
+void btif_hf_twsp_send_bvra_update(int idx, tBTA_AG_RES_DATA* ag_res);
 
 }  // namespace headset
 }  // namespace bluetooth
