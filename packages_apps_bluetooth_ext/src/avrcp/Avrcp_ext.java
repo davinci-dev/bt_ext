@@ -76,6 +76,7 @@ import com.android.bluetooth.R;
 import com.android.bluetooth.Utils;
 import com.android.bluetooth.avrcpcontroller.AvrcpControllerService;
 import com.android.bluetooth.ReflectionUtils;
+import com.android.bluetooth.hearingaid.HearingAidService;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -125,7 +126,6 @@ public final class Avrcp_ext {
     private int mPlayStatusChangedNT;
     private byte mReportedPlayStatus;
     private int mPlayerStatusChangeNT;
-    //private int mReportedPlayStatus;
     private int mTrackChangedNT;
     private int mPlayPosChangedNT;
     private long mSongLengthMs;
@@ -176,7 +176,9 @@ public final class Avrcp_ext {
     private int changePathDepth;
     private byte changePathDirection;
     HashMap<BluetoothDevice, Integer> mVolumeMap = new HashMap();
+    HashMap<BluetoothDevice, Boolean> mDeviceAbsVolMap = new HashMap();
     public static final String VOLUME_MAP = "bluetooth_volume_map";
+    public static final String ABS_VOL_MAP = "bluetooth_ABS_VOL_map";
     private boolean isShoActive = false;
     AudioManagerAudioDeviceCallback mAudioManagerAudioDeviceCallback;
     private boolean twsShoEnabled = false;
@@ -195,6 +197,12 @@ public final class Avrcp_ext {
        "Audi",
        "Porsche"
     };
+
+
+    private static final ArrayList<String> playerBrowseWhiteListDB =
+       new ArrayList<String>(Arrays.asList(
+               "com.google.android.music"
+    ));
 
     /* UID counter to be shared across different files. */
     static short sUIDCounter = AvrcpConstants_ext.DEFAULT_UID_COUNTER;
@@ -266,6 +274,9 @@ public final class Avrcp_ext {
     /* List of Media player instances, useful for retrieving MediaPlayerList or MediaPlayerInfo */
     private SortedMap<Integer, MediaPlayerInfo_ext> mMediaPlayerInfoList;
     private boolean mAvailablePlayerViewChanged;
+
+    private boolean mPlayerSwitching;
+    private List<String> mPkgRequestedMBSConnect;
 
     /* List of media players which supports browse */
     private List<BrowsePlayerInfo_ext> mBrowsePlayerInfoList;
@@ -551,6 +562,8 @@ public final class Avrcp_ext {
         mAvrcpPlayerAppSettingsRsp = new AvrcpPlayerAppSettingsRsp();
         mMediaPlayerInfoList = new TreeMap<Integer, MediaPlayerInfo_ext>();
         mAvailablePlayerViewChanged = false;
+        mPlayerSwitching = false;
+        mPkgRequestedMBSConnect = new ArrayList<String>();
         mBrowsePlayerInfoList = Collections.synchronizedList(new ArrayList<BrowsePlayerInfo_ext>());
         mPassthroughDispatched = 0;
         mPassthroughLogs = new EvictingQueue_ext<MediaKeyLog>(PASSTHROUGH_LOG_MAX_SIZE);
@@ -673,6 +686,7 @@ public final class Avrcp_ext {
         mContext.unregisterReceiver(mAvrcpReceiver);
         mContext.unregisterReceiver(mBootReceiver);
 
+        mPkgRequestedMBSConnect.clear();
         mAddressedMediaPlayer.cleanup();
         mAvrcpBrowseManager.cleanup();
         mCurrentBrowsingDevice = null;
@@ -842,8 +856,6 @@ public final class Avrcp_ext {
                 BluetoothDevice device = mA2dpService.getActiveDevice();
                 if(device == null)
                     break;
-                mAudioManager.avrcpSupportsAbsoluteVolume(device.getAddress(),
-                                                          isAbsoluteVolumeSupported(deviceIndex));
                 if (mAbsVolThreshold > 0 && mAbsVolThreshold < mAudioStreamMax &&
                     vol > mAbsVolThreshold) {
                     if (DEBUG) Log.v(TAG, "remote inital volume too high " + vol + ">" +
@@ -875,7 +887,6 @@ public final class Avrcp_ext {
                        }
                     }
                 }
-                //mLastLocalVolume = -1;
                 break;
             }
 
@@ -905,6 +916,20 @@ public final class Avrcp_ext {
                 deviceFeatures[deviceIndex].isAbsoluteVolumeSupportingDevice =
                         ((deviceFeatures[deviceIndex].mFeatures &
                         BTRC_FEAT_ABSOLUTE_VOLUME) != 0);
+                //store Absolute volume support
+                   Log.d(TAG,"absolute volume support device is present " + mDeviceAbsVolMap.containsKey(deviceFeatures[deviceIndex].mCurrentDevice));
+                if (!mDeviceAbsVolMap.containsKey(deviceFeatures[deviceIndex].mCurrentDevice) ||
+                    (mDeviceAbsVolMap.containsKey(deviceFeatures[deviceIndex].mCurrentDevice) &&
+                   mDeviceAbsVolMap.get(deviceFeatures[deviceIndex].mCurrentDevice) !=
+                   deviceFeatures[deviceIndex].isAbsoluteVolumeSupportingDevice)) {
+                   SharedPreferences.Editor absVolumeMapEditor = getAbsVolumeMap().edit();
+                   mDeviceAbsVolMap.put(deviceFeatures[deviceIndex].mCurrentDevice, (boolean)deviceFeatures[deviceIndex].isAbsoluteVolumeSupportingDevice);
+                   absVolumeMapEditor.putBoolean(deviceFeatures[deviceIndex].mCurrentDevice.getAddress(), deviceFeatures[deviceIndex].isAbsoluteVolumeSupportingDevice);
+                   // Always use apply() since it is asynchronous, otherwise the call can hang waiting for
+                   // storage to be written.
+                   absVolumeMapEditor.apply();
+                   Log.d(TAG,"absolute volume support data saved");
+                }
                 BATService mBatService = BATService.getBATService();
                 if ((mBatService != null) && mBatService.isBATActive()) {
                     Log.d(TAG,"MSG_NATIVE_REQ_GET_RC_FEATURES BA Active, update absvol support as true  ");
@@ -1252,24 +1277,10 @@ public final class Avrcp_ext {
                         /*Avoid send set absolute volume for store volume untill volume registration
                         complete and making synchronization to send only one setAbsolute volume
                         during connection*/
-                        if(getVolume(deviceFeatures[deviceIndex].mCurrentDevice) != -1) {
+                        int val = getVolume(deviceFeatures[deviceIndex].mCurrentDevice);
+                        if (val != volIndex) {
                             deviceFeatures[deviceIndex].mRemoteVolume = absVol;
                             setAbsVolumeFlag(deviceFeatures[deviceIndex].mCurrentDevice);
-                            break;
-                        }
-                        /*if volume is stored than no need to send setAbsoluteVolume use register volume*/
-                        else if(mAbsVolThreshold > 0 && mAbsVolThreshold < mAudioStreamMax &&
-                          volIndex > mAbsVolThreshold) {
-                            //To handle volume when device volume is not stored during
-                            // paring
-                            if (DEBUG) Log.v(TAG, "remote inital volume too high " + volIndex + ">" +
-                                mAbsVolThreshold);
-                            Message msg1 = mHandler.obtainMessage(MSG_SET_ABSOLUTE_VOLUME,
-                                mAbsVolThreshold , 0);
-                            mHandler.sendMessage(msg1);
-                            deviceFeatures[deviceIndex].mRemoteVolume = absVol;
-                            deviceFeatures[deviceIndex].mLocalVolume = volIndex;
-                            deviceFeatures[deviceIndex].mLastRequestedVolume = -1;
                             break;
                         }
                     }
@@ -2103,16 +2114,21 @@ public final class Avrcp_ext {
                 String CurrentPackageName = (mMediaController != null) ? mMediaController.getPackageName():null;
                 artistName = stringOrBlank(data.getString(MediaMetadata.METADATA_KEY_ARTIST));
                 albumName = stringOrBlank(data.getString(MediaMetadata.METADATA_KEY_ALBUM));
+                if (albumName.isEmpty()) {
+                  albumName =
+                      stringOrBlank(data.getString(MediaMetadata.METADATA_KEY_ALBUM_ARTIST));
+                  Log.d(TAG,"overwrite album_artist :" + albumName + "if album is blank");
+                }
                 if (CurrentPackageName != null && !(CurrentPackageName.equals("com.android.music"))) {
                     mediaNumber = longStringOrBlank((data.getLong(MediaMetadata.METADATA_KEY_TRACK_NUMBER)));
                 } else {
                     /* playlist starts with 0 for default player*/
                     mediaNumber = longStringOrBlank((data.getLong(MediaMetadata.METADATA_KEY_TRACK_NUMBER) + 1L));
-            }
+                }
                 mediaTotalNumber = longStringOrBlank(data.getLong(MediaMetadata.METADATA_KEY_NUM_TRACKS));
                 genre = stringOrBlank(data.getString(MediaMetadata.METADATA_KEY_GENRE));
                 playingTimeMs = data.getLong(MediaMetadata.METADATA_KEY_DURATION);
-                if (DEBUG) Log.d(TAG," albumName :" + albumName + " device :" + device);
+                Log.d(TAG," albumName :" + albumName + " device :" + device);
                 if (mAvrcpBipRsp != null && device != null)
                     coverArt = stringOrBlank(mAvrcpBipRsp.getImgHandle(device, albumName));
                 else coverArt = stringOrBlank(null);
@@ -2340,33 +2356,45 @@ public final class Avrcp_ext {
                     deviceFeatures[index].mReportedPlayerID != mCurrAddrPlayerID) {
                 Log.v(TAG, "Update player id: " + deviceFeatures[index].mReportedPlayerID +
                         "-> " + mCurrAddrPlayerID);
-                if (deviceFeatures[index].mAvailablePlayersChangedNT ==
-                        AvrcpConstants_ext.NOTIFICATION_TYPE_INTERIM) {
-                    registerNotificationRspAvalPlayerChangedNative(
-                            AvrcpConstants_ext.NOTIFICATION_TYPE_CHANGED, addr);
-                    mAvailablePlayerViewChanged = false;
-                    deviceFeatures[index].mAvailablePlayersChangedNT =
+                String currPkg = getPackageName(mCurrAddrPlayerID);
+                String prevPkg = getPackageName(deviceFeatures[index].mReportedPlayerID);
+                if ((currPkg != null && !currPkg.isEmpty() &&
+                        playerBrowseWhiteListDB.contains(currPkg))
+                        || (prevPkg != null && !prevPkg.isEmpty() &&
+                        playerBrowseWhiteListDB.contains(prevPkg))) {
+                    if (deviceFeatures[index].mAvailablePlayersChangedNT ==
+                                AvrcpConstants_ext.NOTIFICATION_TYPE_INTERIM) {
+                        registerNotificationRspAvalPlayerChangedNative(
+                                AvrcpConstants_ext.NOTIFICATION_TYPE_CHANGED, addr);
+                        mAvailablePlayerViewChanged = false;
+                        deviceFeatures[index].mAvailablePlayersChangedNT =
+                                AvrcpConstants_ext.NOTIFICATION_TYPE_CHANGED;
+                    }
+                    if (deviceFeatures[index].mAddrPlayerChangedNT ==
+                                AvrcpConstants_ext.NOTIFICATION_TYPE_INTERIM) {
+                        registerNotificationRspAddrPlayerChangedNative(
+                                AvrcpConstants_ext.NOTIFICATION_TYPE_CHANGED, mCurrAddrPlayerID,
+                                sUIDCounter, addr);
+                        deviceFeatures[index].mAddrPlayerChangedNT =
+                                AvrcpConstants_ext.NOTIFICATION_TYPE_CHANGED;
+                    }
+
+                    // Update the now playing list without sending the notification
+                    deviceFeatures[index].mNowPlayingListChangedNT =
                             AvrcpConstants_ext.NOTIFICATION_TYPE_CHANGED;
-                }
-                if (deviceFeatures[index].mAddrPlayerChangedNT ==
-                        AvrcpConstants_ext.NOTIFICATION_TYPE_INTERIM) {
-                    registerNotificationRspAddrPlayerChangedNative(
-                            AvrcpConstants_ext.NOTIFICATION_TYPE_CHANGED, mCurrAddrPlayerID,
-                            sUIDCounter, addr);
-                    deviceFeatures[index].mAddrPlayerChangedNT =
-                            AvrcpConstants_ext.NOTIFICATION_TYPE_CHANGED;
+                    mAddressedMediaPlayer.updateNowPlayingList(mMediaController);
+                    deviceFeatures[index].mNowPlayingListChangedNT =
+                            AvrcpConstants_ext.NOTIFICATION_TYPE_INTERIM;
                 }
                 deviceFeatures[index].mReportedPlayerID = mCurrAddrPlayerID;
-
-                // Update the now playing list without sending the notification
-                deviceFeatures[index].mNowPlayingListChangedNT = AvrcpConstants_ext.NOTIFICATION_TYPE_CHANGED;
-                mAddressedMediaPlayer.updateNowPlayingList(mMediaController);
-                deviceFeatures[index].mNowPlayingListChangedNT = AvrcpConstants_ext.NOTIFICATION_TYPE_INTERIM;
             }
 
             // Dont send now playing list changed if the player doesn't support browsing
             MediaPlayerInfo_ext info = getAddressedPlayerInfo();
-            if (info != null && info.isBrowseSupported()) {
+            String pkg = (info != null) ? info.getPackageName():"";
+            boolean isPlayerInBrowseList = (pkg != null) && (!pkg.isEmpty()) &&
+                    playerBrowseWhiteListDB.contains(pkg);
+            if (isPlayerInBrowseList) {
                 Log.v(TAG, "Check if NowPlayingList is updated");
                 mAddressedMediaPlayer.updateNowPlayingList(mMediaController);
             }
@@ -2666,10 +2694,13 @@ public final class Avrcp_ext {
         if (registering)
             deviceFeatures[deviceIndex].mTrackChangedNT = AvrcpConstants_ext.NOTIFICATION_TYPE_INTERIM;
 
-        MediaPlayerInfo_ext info = getAddressedPlayerInfo();
         byte[] byteAddr = getByteAddress(deviceFeatures[deviceIndex].mCurrentDevice);
+        MediaPlayerInfo_ext info = getAddressedPlayerInfo();
+        String currPkg = (info != null) ? info.getPackageName():"";
+        boolean isPlayerInBrowseList = (currPkg != null) && (!currPkg.isEmpty()) &&
+                playerBrowseWhiteListDB.contains(currPkg);
         // for non-browsable players or no player
-        if ((info != null && !info.isBrowseSupported()) ||
+        if (!isPlayerInBrowseList ||
                 (deviceFeatures[deviceIndex].mFeatures & BTRC_FEAT_BROWSE) == 0) {
             byte[] track = AvrcpConstants_ext.TRACK_IS_SELECTED;
             if (!mMediaAttributes.exists) track = AvrcpConstants_ext.NO_TRACK_SELECTED;
@@ -2790,6 +2821,23 @@ public final class Avrcp_ext {
 
         }
         return playStatus;
+    }
+
+    private boolean isPlayerInBrowseList() {
+        MediaPlayerInfo_ext info = getAddressedPlayerInfo();
+        String pkgName = (info != null) ? info.getPackageName():"";
+        if (pkgName == null || pkgName.isEmpty())
+            return false;
+
+        BrowsedMediaPlayer_ext player =
+                mAvrcpBrowseManager.getBrowsedMediaPlayer(dummyaddr);
+        String browseService = (pkgName != null)?getBrowseServiceName(pkgName):null;
+        if (player == null || browseService == null || browseService.isEmpty())
+            return false;
+
+        boolean isBrowseSupported = player.isPackageInMBSList(pkgName);
+        Log.d(TAG, "Browse supported for pkg " + pkgName + " is " + isBrowseSupported);
+        return isBrowseSupported;
     }
 
     private boolean isPlayingState(@Nullable PlaybackState state) {
@@ -3271,25 +3319,21 @@ public final class Avrcp_ext {
         BrowsedMediaPlayer_ext player = mAvrcpBrowseManager.getBrowsedMediaPlayer(dummyaddr);
         Log.w(TAG, "SetBrowsePackage for pkg " + PackageName + "svc" + browseService);
         if (browseService != null && !browseService.isEmpty()) {
-            BluetoothDevice active_device = null;
-            for (int i = 0; i < maxAvrcpConnections; i++) {
-                if (deviceFeatures[i].mCurrentDevice != null &&
-                        deviceFeatures[i].isActiveDevice == true) {
-                    Log.w(TAG,"Device " + deviceFeatures[i].mCurrentDevice.getAddress() +" active");
-                    active_device = deviceFeatures[i].mCurrentDevice;
-                }
-            }
-            if (active_device != null) {
+            BluetoothDevice browse_active_device = mBrowsingActiveDevice;
+            if (browse_active_device != null) {
                 is_player_updated_for_browse = true;
-                byte[] addr = getByteAddress(active_device);
+                byte[] addr = getByteAddress(browse_active_device);
                 if (mAvrcpBrowseManager.getBrowsedMediaPlayer(addr) != null) {
-                    mCurrentBrowsingDevice = active_device;
+                    Log.w(TAG, "Addr Player update to Browse " + PackageName +
+                            " already req MBS list " + mPkgRequestedMBSConnect);
+                    mCurrentBrowsingDevice = browse_active_device;
                     Log.w(TAG, "Addr Player update to Browse " + PackageName);
                     mAvrcpBrowseManager.getBrowsedMediaPlayer(addr).
                             setCurrentPackage(PackageName, browseService);
-                    if (player != null) {
+                    if (player != null && !mPkgRequestedMBSConnect.contains(PackageName)) {
                         Log.w(TAG,"checkMBSConnection try connect");
                         player.CheckMBSConnection(PackageName, browseService);
+                        mPkgRequestedMBSConnect.add(PackageName);
                     }
                 }
             } else {
@@ -3322,6 +3366,12 @@ public final class Avrcp_ext {
         SharedPreferences.Editor editor = pref.edit();
         editor.putBoolean(mAddress, true);
         editor.commit();
+        SharedPreferences.Editor absVolumeMapEditor = getAbsVolumeMap().edit();
+        mDeviceAbsVolMap.put(deviceFeatures[i].mCurrentDevice, false);
+        absVolumeMapEditor.putBoolean(mAddress, false);
+        // Always use apply() since it is asynchronous, otherwise the call can hang waiting for
+        // storage to be written.
+        absVolumeMapEditor.apply();
         Log.v(TAG, "Exit blackListCurrentDevice");
     }
 
@@ -3343,9 +3393,26 @@ public final class Avrcp_ext {
     public void resetBlackList(String address) {
         SharedPreferences pref = mContext.getSharedPreferences(ABSOLUTE_VOLUME_BLACKLIST,
                 Context.MODE_PRIVATE);
+        if (!pref.contains(address)) {
+            Log.v(TAG, "resetBlackList : device is not added in blacklist");
+            return;
+        }
         SharedPreferences.Editor editor = pref.edit();
         editor.remove(address);
         editor.apply();
+        SharedPreferences.Editor absVolumeMapEditor = getAbsVolumeMap().edit();
+        BluetoothDevice device = BluetoothAdapter.getDefaultAdapter().getRemoteDevice(address);
+        if (device != null && device.getBondState() == BluetoothDevice.BOND_NONE) {
+            Log.v(TAG, "resetBlackList : device state is unbonded");
+            return;
+        }
+        mDeviceAbsVolMap.put(device, true);
+        absVolumeMapEditor.putBoolean(address, true);
+        // Always use apply() since it is asynchronous, otherwise the call can hang waiting for
+        // storage to be written.
+        absVolumeMapEditor.apply();
+        //updating audio for absolute volume support
+        mAudioManager.avrcpSupportsAbsoluteVolume(address, true);
     }
 
     /**
@@ -3470,8 +3537,6 @@ public final class Avrcp_ext {
             (Objects.equals(mDevice, deviceFeatures[index].mCurrentDevice) ||
              (mDevice.isTwsPlusDevice() && device.isTwsPlusDevice()))) {
             setActiveDevice(deviceFeatures[index].mCurrentDevice);
-            //setActiveDevice(mDevice);
-            //below line to send setAbsolute volume if device is suporting absolute volume
             //When A2dp playing on DUT and Remote got connected, send proper playstatus
             if (isPlayingState(mCurrentPlayerState) &&
                 mA2dpService.isA2dpPlaying(device)) {
@@ -3505,16 +3570,11 @@ public final class Avrcp_ext {
                 deviceFeatures[i].mRemoteVolume = -1;
                 deviceFeatures[i].mLocalVolume = -1;
             }
-            /* Multicast scenario both abs vol supported
-               Active device got disconnected so make other
-               device which is left supporting absolute
-               volume as active device
-            */
             if (deviceFeatures[i].mCurrentDevice != null && device != null &&
                     !(Objects.equals(deviceFeatures[i].mCurrentDevice, device))) {
                 Log.i(TAG,"setAvrcpDisconnectedDevice : Active device changed to index = " + i);
                 if (device.isTwsPlusDevice() &&
-                    isTwsPlusPair(device,deviceFeatures[i].mCurrentDevice )) {
+                    isTwsPlusPair(device,deviceFeatures[i].mCurrentDevice)) {
                     Log.i(TAG,"TWS+ pair got disconnected,update absVolume");
                     updateAbsVolume = true;
                     Log.i(TAG,"TWS+ pair disconnected, set mTwsPairDisconnected for index " + i);
@@ -3753,7 +3813,7 @@ public final class Avrcp_ext {
             if (!isPackageNameValid(browsedPackage)) {
                 Log.w(TAG, " Invalid package for id:" + mCurrBrowsePlayerID);
                 status = AvrcpConstants_ext.RSP_INV_PLAYER;
-            } else if (!isBrowseSupported(browsedPackage)) {
+            } else if (!playerBrowseWhiteListDB.contains(browsedPackage)) {
                 Log.w(TAG, "Browse unsupported for id:" + mCurrBrowsePlayerID
                         + ", packagename : " + browsedPackage);
                 status = AvrcpConstants_ext.RSP_PLAY_NOT_BROW;
@@ -4329,8 +4389,8 @@ public final class Avrcp_ext {
                     String browsedPackage = getPackageName(mCurrAddrPlayerID);
                     BrowsedMediaPlayer_ext player =
                             mAvrcpBrowseManager.getBrowsedMediaPlayer(dummyaddr);
-                    if ((player != null) && (!browsedPackage.isEmpty()) &&
-                            player.isPackageInMBSList(browsedPackage)) {
+                    String currPkg = (info != null) ? info.getPackageName():"";
+                    if (playerBrowseWhiteListDB.contains(currPkg)) {
                         for (int numBit = 0; numBit < featureBits.length; numBit++) {
                             /* gives which octet this belongs to */
                             byte octet = (byte) (featureBits[numBit] / 8);
@@ -5163,18 +5223,56 @@ public final class Avrcp_ext {
         }
         return INVALID_DEVICE_INDEX;
     }
+
+    public void removeVolumeForDevice(BluetoothDevice device) {
+        if (device == null || device.getBondState() != BluetoothDevice.BOND_NONE)
+            return;
+        SharedPreferences.Editor pref = getVolumeMap().edit();
+        SharedPreferences.Editor prefAbs = getAbsVolumeMap().edit();
+        Log.i(TAG, "RemoveStoredVolume: Remove stored stream volume level and abs volume support for device " + device);
+        mVolumeMap.remove(device);
+        pref.remove(device.getAddress());
+        // Always use apply() since it is asynchronous, otherwise the call can hang waiting for
+        // storage to be written.
+        pref.apply();
+        //remove absoute volume support
+        mDeviceAbsVolMap.remove(device);
+        prefAbs.remove(device.getAddress());
+        // Always use apply() since it is asynchronous, otherwise the call can hang waiting for
+        // storage to be written.
+        prefAbs.apply();
+    }
+
     public void storeVolumeForDevice(BluetoothDevice device) {
+        /*Due to race condtion between active device change and bond state change, if bond state
+         change event handled first and active device change later than volume will not stored
+         if bond state is not paired */
+        if (device != null && device.getBondState() == BluetoothDevice.BOND_NONE) {
+            Log.i(TAG, "storeVolume: not saved because bond state is none");
+            return;
+        }
         SharedPreferences.Editor pref = getVolumeMap().edit();
         int index = getIndexForDevice(device);
         int storeVolume =  mAudioManager.getStreamVolume(AudioManager.STREAM_MUSIC);
         Log.i(TAG, "storeVolume: Storing stream volume level for device " + device
                 + " : " + storeVolume);
-        if (index != INVALID_DEVICE_INDEX && deviceFeatures[index].isAbsoluteVolumeSupportingDevice &&
-           (mAbsVolThreshold > 0 && mAbsVolThreshold < mAudioStreamMax &&
-           storeVolume > mAbsVolThreshold)) {
+
+        List<BluetoothDevice> HAActiveDevices = null;
+        HearingAidService mHaService = HearingAidService.getHearingAidService();
+        if (mHaService != null) {
+          HAActiveDevices = mHaService.getActiveDevices();
+        }
+        if (HAActiveDevices != null && (HAActiveDevices.get(0) != null
+                || HAActiveDevices.get(1) != null)) {
+          Log.d(TAG, "Do not store volume when Hearing Aid device is active");
+          return;
+        }
+
+        if (mAbsVolThreshold > 0 && mAbsVolThreshold < mAudioStreamMax &&
+           storeVolume > mAbsVolThreshold) {
             if (DEBUG) Log.v(TAG, "remote store volume too high" + storeVolume + ">" +
                mAbsVolThreshold);
-                storeVolume = mAbsVolThreshold;
+            storeVolume = mAbsVolThreshold;
         }
         if (index == INVALID_DEVICE_INDEX && disconnectedActiveDevice != null &&
             disconnectedActiveDevice.equals(device)) {
@@ -5281,6 +5379,10 @@ public final class Avrcp_ext {
         return mContext.getSharedPreferences(VOLUME_MAP, Context.MODE_PRIVATE);
     }
 
+    private SharedPreferences getAbsVolumeMap() {
+        return mContext.getSharedPreferences(ABS_VOL_MAP, Context.MODE_PRIVATE);
+    }
+
     private void Avrcp_extVolumeManager() {
         // Load the stored volume preferences into a hash map since shared preferences are slow
         // to poll and update. If the device has been unbonded since last start remove it from
@@ -5301,12 +5403,29 @@ public final class Avrcp_ext {
             }
         }
         volumeMapEditor.apply();
+
+        allKeys = getAbsVolumeMap().getAll();
+        SharedPreferences.Editor absVolumeMapEditor = getAbsVolumeMap().edit();
+        for (Map.Entry<String, ?> entry : allKeys.entrySet()) {
+            String key = entry.getKey();
+            Object value = entry.getValue();
+            BluetoothDevice d = BluetoothAdapter.getDefaultAdapter().getRemoteDevice(key);
+
+            if (value instanceof Boolean && d.getBondState() == BluetoothDevice.BOND_BONDED) {
+                mDeviceAbsVolMap.put(d, (Boolean) value);
+                Log.w(TAG, "Address " + key + " from the absolute volume map support :" + value);
+            } else {
+                Log.w(TAG, "Removing " + key + " from the absolute volume map support state" + d.getBondState());
+                absVolumeMapEditor.remove(key);
+            }
+        }
+        absVolumeMapEditor.apply();
     }
 
     public int getVolume(BluetoothDevice device) {
         if (!mVolumeMap.containsKey(device)) {
             Log.w(TAG, "getVolume: Couldn't find volume preference for device: " + device);
-            return -1;
+            return mAudioStreamMax/2;
         }
         Log.d(TAG, "getVolume: Returning volume " + mVolumeMap.get(device));
         return mVolumeMap.get(device);
@@ -5314,19 +5433,26 @@ public final class Avrcp_ext {
 
     public void setAbsVolumeFlag(BluetoothDevice device) {
         int deviceIndex = getIndexForDevice(device);
+        int volume = getVolume(device);
+        Log.d(TAG, " device allocated for abs volume support " + mDeviceAbsVolMap.containsKey(device));
+        if (mDeviceAbsVolMap.containsKey(device)) {
+            //updating abs volume supported or not to audio when active device change is success
+            Log.d(TAG, " Returning abs volume support " + mDeviceAbsVolMap.get(device));
+            mAudioManager.avrcpSupportsAbsoluteVolume(device.getAddress(), mDeviceAbsVolMap.get(device));
+        } else {
+            //absolute volume is not stored upadtion false by default
+            Log.d(TAG, "Returning abs volume support false ");
+            mAudioManager.avrcpSupportsAbsoluteVolume(device.getAddress(), false);
+        }
         if (deviceIndex == INVALID_DEVICE_INDEX) {
             Log.e(TAG,"Invalid device index for setAbsVolumeFlag");
             return;
         }
-        int volume = getVolume(device);
-        //updating abs volume supported or not to audio when active device change is success
-        mAudioManager.avrcpSupportsAbsoluteVolume(device.getAddress(),
-            isAbsoluteVolumeSupported(deviceIndex));
         if(deviceFeatures[deviceIndex].isAbsoluteVolumeSupportingDevice == false) {
             Log.d(TAG,"isAbsoluteVolumeSupportingDevice is false or volume is not stored");
             return;
         }
-        if(deviceFeatures[deviceIndex].mInitialRemoteVolume == -1 || volume == -1) {
+        if(deviceFeatures[deviceIndex].mInitialRemoteVolume == -1) {
             Log.e(TAG,"intial volume is not updated or volume is not stored");
             return;
         }
